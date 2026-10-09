@@ -67,6 +67,7 @@ impl ows_pay::WalletAccess for OwsLibWallet {
                     Some(&self.passphrase),
                     None,
                     None,
+                    None,
                 )
                 .map_err(|e| {
                     ows_pay::PayError::new(ows_pay::PayErrorCode::SigningFailed, e.to_string())
@@ -117,7 +118,11 @@ pub fn run(
             }
         }
     } else {
-        eprintln!("HTTP {}", result.status);
+        if result.payment.is_some() {
+            eprintln!("HTTP {} — payment rejected by server", result.status);
+        } else {
+            eprintln!("HTTP {}", result.status);
+        }
     }
 
     println!("{}", result.body);

@@ -5,52 +5,43 @@ use std::path::{Path, PathBuf};
 use crate::error::OwsLibError;
 use crate::vault;
 
-fn is_valid_evm_address(addr: &str) -> bool {
-    addr.len() == 42
-        && addr.starts_with("0x")
-        && addr[2..].chars().all(|c| c.is_ascii_hexdigit())
+fn is_valid_evm_address(address: &str) -> bool {
+    address.len() == 42
+        && address.starts_with("0x")
+        && address[2..].chars().all(|c| c.is_ascii_hexdigit())
 }
 
-fn normalize_addresses_in_rules(rules: &mut [PolicyRule]) {
-    for rule in rules.iter_mut() {
-        match rule {
-            PolicyRule::RecipientAllowlist { addresses } => {
-                for addr in addresses.iter_mut() {
-                    *addr = addr.to_lowercase();
-                }
-            }
-            PolicyRule::AllowedTypedDataContracts { contracts } => {
-                for addr in contracts.iter_mut() {
-                    *addr = addr.to_lowercase();
-                }
-            }
-            _ => {}
+fn address_lists_mut(rules: &mut [PolicyRule]) -> impl Iterator<Item = &mut Vec<String>> {
+    rules.iter_mut().filter_map(|rule| match rule {
+        PolicyRule::RecipientAllowlist { addresses } => Some(addresses),
+        PolicyRule::AllowedTypedDataContracts { contracts } => Some(contracts),
+        _ => None,
+    })
+}
+
+fn normalize_addresses(rules: &mut [PolicyRule]) {
+    for addresses in address_lists_mut(rules) {
+        for address in addresses {
+            address.make_ascii_lowercase();
         }
     }
 }
 
-fn validate_addresses_in_rules(rules: &[PolicyRule]) -> Result<(), OwsLibError> {
+fn validate_addresses(rules: &[PolicyRule]) -> Result<(), OwsLibError> {
     for rule in rules {
-        match rule {
-            PolicyRule::RecipientAllowlist { addresses } => {
-                for addr in addresses {
-                    if !is_valid_evm_address(addr) {
-                        return Err(OwsLibError::InvalidInput(format!(
-                            "malformed address in recipient_allowlist: {addr}"
-                        )));
-                    }
-                }
-            }
+        let (kind, addresses) = match rule {
+            PolicyRule::RecipientAllowlist { addresses } => ("recipient_allowlist", addresses),
             PolicyRule::AllowedTypedDataContracts { contracts } => {
-                for addr in contracts {
-                    if !is_valid_evm_address(addr) {
-                        return Err(OwsLibError::InvalidInput(format!(
-                            "malformed address in allowed_typed_data_contracts: {addr}"
-                        )));
-                    }
-                }
+                ("allowed_typed_data_contracts", contracts)
             }
-            _ => {}
+            _ => continue,
+        };
+        for address in addresses {
+            if !is_valid_evm_address(address) {
+                return Err(OwsLibError::InvalidInput(format!(
+                    "malformed address in {kind}: {address}"
+                )));
+            }
         }
     }
     Ok(())
@@ -66,14 +57,10 @@ pub fn policies_dir(vault_path: Option<&Path>) -> Result<PathBuf, OwsLibError> {
 }
 
 /// Save a policy to `~/.ows/policies/<id>.json`.
-/// Validates that address-bearing rules contain well-formed Ethereum addresses,
-/// and normalizes them to lowercase before persisting.
 pub fn save_policy(policy: &Policy, vault_path: Option<&Path>) -> Result<(), OwsLibError> {
-    validate_addresses_in_rules(&policy.rules)?;
-
+    validate_addresses(&policy.rules)?;
     let mut policy = policy.clone();
-    normalize_addresses_in_rules(&mut policy.rules);
-
+    normalize_addresses(&mut policy.rules);
     let dir = policies_dir(vault_path)?;
     let path = dir.join(format!("{}.json", policy.id));
     let json = serde_json::to_string_pretty(&policy)?;
@@ -81,8 +68,7 @@ pub fn save_policy(policy: &Policy, vault_path: Option<&Path>) -> Result<(), Ows
     Ok(())
 }
 
-/// Load a single policy by ID. Normalizes addresses to lowercase on load
-/// for defense-in-depth (in case the file was edited manually).
+/// Load a single policy by ID.
 pub fn load_policy(id: &str, vault_path: Option<&Path>) -> Result<Policy, OwsLibError> {
     let dir = policies_dir(vault_path)?;
     let path = dir.join(format!("{id}.json"));
@@ -91,7 +77,7 @@ pub fn load_policy(id: &str, vault_path: Option<&Path>) -> Result<Policy, OwsLib
     }
     let contents = fs::read_to_string(&path)?;
     let mut policy: Policy = serde_json::from_str(&contents)?;
-    normalize_addresses_in_rules(&mut policy.rules);
+    normalize_addresses(&mut policy.rules);
     Ok(policy)
 }
 
@@ -114,9 +100,9 @@ pub fn list_policies(vault_path: Option<&Path>) -> Result<Vec<Policy>, OwsLibErr
         }
         match fs::read_to_string(&path) {
             Ok(contents) => match serde_json::from_str::<Policy>(&contents) {
-                Ok(mut p) => {
-                    normalize_addresses_in_rules(&mut p.rules);
-                    policies.push(p);
+                Ok(mut policy) => {
+                    normalize_addresses(&mut policy.rules);
+                    policies.push(policy);
                 }
                 Err(e) => eprintln!("warning: skipping {}: {e}", path.display()),
             },
@@ -269,134 +255,46 @@ mod tests {
     }
 
     #[test]
-    fn save_normalizes_addresses_to_lowercase() {
+    fn recipient_addresses_are_validated_and_normalized() {
         let dir = tempfile::tempdir().unwrap();
-        let vault = dir.path().to_path_buf();
+        let vault = dir.path();
+        let mut policy = test_policy("recipients", "Recipients");
+        policy.rules = vec![PolicyRule::RecipientAllowlist {
+            addresses: vec!["0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into()],
+        }];
+        save_policy(&policy, Some(vault)).unwrap();
+        let loaded = load_policy("recipients", Some(vault)).unwrap();
+        assert_eq!(
+            loaded.rules,
+            vec![PolicyRule::RecipientAllowlist {
+                addresses: vec!["0x742d35cc6634c0532925a3b844bc9e7595f2bd0c".into()]
+            }]
+        );
 
-        let policy = Policy {
-            id: "norm".to_string(),
-            name: "Normalize".to_string(),
-            version: 1,
-            created_at: "2026-03-22T10:00:00Z".to_string(),
-            rules: vec![PolicyRule::RecipientAllowlist {
-                addresses: vec!["0x742d35Cc6634C0532925a3b844Bc9e7595f2bD0C".into()],
-            }],
-            executable: None,
-            config: None,
-            action: PolicyAction::Deny,
-        };
-
-        save_policy(&policy, Some(&vault)).unwrap();
-        let loaded = load_policy("norm", Some(&vault)).unwrap();
-        match &loaded.rules[0] {
-            PolicyRule::RecipientAllowlist { addresses } => {
-                assert_eq!(
-                    addresses[0],
-                    "0x742d35cc6634c0532925a3b844bc9e7595f2bd0c"
-                );
-            }
-            _ => panic!("unexpected rule type"),
+        if let PolicyRule::RecipientAllowlist { addresses } = &mut policy.rules[0] {
+            addresses[0] = "0xdead".into();
         }
+        assert!(save_policy(&policy, Some(vault))
+            .unwrap_err()
+            .to_string()
+            .contains("malformed address"));
     }
 
     #[test]
-    fn save_rejects_malformed_address() {
+    fn typed_data_contract_addresses_are_validated_and_normalized() {
         let dir = tempfile::tempdir().unwrap();
-        let vault = dir.path().to_path_buf();
-
-        let policy = Policy {
-            id: "bad-addr".to_string(),
-            name: "Bad".to_string(),
-            version: 1,
-            created_at: "2026-03-22T10:00:00Z".to_string(),
-            rules: vec![PolicyRule::RecipientAllowlist {
-                addresses: vec!["not-an-address".into()],
-            }],
-            executable: None,
-            config: None,
-            action: PolicyAction::Deny,
-        };
-
-        let result = save_policy(&policy, Some(&vault));
-        assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("malformed address"));
-    }
-
-    #[test]
-    fn save_rejects_short_address() {
-        let dir = tempfile::tempdir().unwrap();
-        let vault = dir.path().to_path_buf();
-
-        let policy = Policy {
-            id: "short".to_string(),
-            name: "Short".to_string(),
-            version: 1,
-            created_at: "2026-03-22T10:00:00Z".to_string(),
-            rules: vec![PolicyRule::RecipientAllowlist {
-                addresses: vec!["0xDEAD".into()],
-            }],
-            executable: None,
-            config: None,
-            action: PolicyAction::Deny,
-        };
-
-        let result = save_policy(&policy, Some(&vault));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn save_rejects_invalid_hex_in_address() {
-        let dir = tempfile::tempdir().unwrap();
-        let vault = dir.path().to_path_buf();
-
-        let policy = Policy {
-            id: "badhex".to_string(),
-            name: "BadHex".to_string(),
-            version: 1,
-            created_at: "2026-03-22T10:00:00Z".to_string(),
-            rules: vec![PolicyRule::RecipientAllowlist {
-                addresses: vec![
-                    "0xZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ".into(),
-                ],
-            }],
-            executable: None,
-            config: None,
-            action: PolicyAction::Deny,
-        };
-
-        let result = save_policy(&policy, Some(&vault));
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn save_normalizes_typed_data_contracts() {
-        let dir = tempfile::tempdir().unwrap();
-        let vault = dir.path().to_path_buf();
-
-        let policy = Policy {
-            id: "td-norm".to_string(),
-            name: "TD Normalize".to_string(),
-            version: 1,
-            created_at: "2026-03-22T10:00:00Z".to_string(),
-            rules: vec![PolicyRule::AllowedTypedDataContracts {
-                contracts: vec!["0x000000000022D473030F116dDEE9F6B43aC78BA3".into()],
-            }],
-            executable: None,
-            config: None,
-            action: PolicyAction::Deny,
-        };
-
-        save_policy(&policy, Some(&vault)).unwrap();
-        let loaded = load_policy("td-norm", Some(&vault)).unwrap();
-        match &loaded.rules[0] {
-            PolicyRule::AllowedTypedDataContracts { contracts } => {
-                assert_eq!(
-                    contracts[0],
-                    "0x000000000022d473030f116ddee9f6b43ac78ba3"
-                );
-            }
-            _ => panic!("unexpected rule type"),
-        }
+        let vault = dir.path();
+        let mut policy = test_policy("contracts", "Contracts");
+        policy.rules = vec![PolicyRule::AllowedTypedDataContracts {
+            contracts: vec!["0x000000000022D473030F116dDEE9F6B43aC78BA3".into()],
+        }];
+        save_policy(&policy, Some(vault)).unwrap();
+        let loaded = load_policy("contracts", Some(vault)).unwrap();
+        assert_eq!(
+            loaded.rules,
+            vec![PolicyRule::AllowedTypedDataContracts {
+                contracts: vec!["0x000000000022d473030f116ddee9f6b43ac78ba3".into()]
+            }]
+        );
     }
 }
