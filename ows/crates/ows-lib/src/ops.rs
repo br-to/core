@@ -1,6 +1,5 @@
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use zeroize::Zeroizing;
 
 use ows_core::{
@@ -188,6 +187,9 @@ fn derive_all_accounts_from_keys(keys: &KeyPair) -> Result<Vec<WalletAccount>, O
     let mut accounts = Vec::with_capacity(UNIVERSAL_WALLET_ACCOUNT_COUNT);
     for chain in universal_wallet_chains() {
         let signer = signer_for_chain(&chain)?;
+        if !signer.supports_private_key_import() {
+            continue;
+        }
         let key = keys.key_for_curve(signer.curve());
         let address = signer.derive_address(key)?;
         accounts.push(WalletAccount {
@@ -386,7 +388,17 @@ pub fn import_wallet_private_key(
         .transpose()?;
 
     let source_curve = match chain {
-        Some(c) => signer_for_chain(&parse_chain(c)?)?.curve(),
+        Some(c) => {
+            let signer = signer_for_chain(&parse_chain(c)?)?;
+            // Such a chain gets no account from raw keys, so importing one would succeed without
+            // the account the caller asked for.
+            if !signer.supports_private_key_import() {
+                return Err(OwsLibError::InvalidInput(format!(
+                    "{c} wallets can only be created from a mnemonic"
+                )));
+            }
+            signer.curve()
+        }
         None => ows_signer::Curve::Secp256k1,
     };
 
@@ -787,6 +799,16 @@ pub fn sign_and_send(
             crate::key_ops::load_authorized_wallet(credential, wallet, vault_path)?;
         let signer = signer_for_chain(&chain_info)?;
 
+        // The prefix sends the operator's Blockfrost project_id to any host, so a
+        // token holder could use it to capture the key.
+        if rpc_url.is_some_and(|url| url.starts_with(ows_core::BLOCKFROST_URL_PREFIX)) {
+            return Err(OwsLibError::InvalidInput(format!(
+                "an API token cannot select an RPC URL with the `{}` prefix; \
+                 set a custom Blockfrost host in the operator config instead",
+                ows_core::BLOCKFROST_URL_PREFIX
+            )));
+        }
+
         // An explicit URL wins; otherwise resolve the configured one for the chains whose
         // make_transaction_context cannot build a context without it.
         let resolved_rpc_url = match rpc_url {
@@ -933,95 +955,21 @@ fn broadcast(chain: ChainType, rpc_url: &str, signed_bytes: &[u8]) -> Result<Str
         ChainType::Nano => broadcast_nano(rpc_url, signed_bytes),
         ChainType::Near => crate::near_rpc::broadcast_tx_commit(rpc_url, signed_bytes),
         ChainType::Cardano => broadcast_cardano(rpc_url, signed_bytes),
+        ChainType::Midnight => Err(OwsLibError::InvalidInput(
+            "Midnight send is not wired until transaction signing is integrated".into(),
+        )),
     }
 }
 
 fn broadcast_cardano(rpc_url: &str, signed_bytes: &[u8]) -> Result<String, OwsLibError> {
-    let expected_tx_hash = ows_signer::chains::CardanoSigner::transaction_id(signed_bytes)?;
-    let url = format!("{}/submittx", rpc_url.trim_end_matches('/'));
-
-    // `--data-binary @-` tells curl to read the request body verbatim from stdin
-    let mut child = Command::new("curl")
-        .args([
-            "-sSL",
-            "-X",
-            "POST",
-            "-H",
-            "Content-Type: application/cbor",
-            "--data-binary",
-            "@-",
-            "-w",
-            "\n%{http_code}",
-            &url,
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            OwsLibError::BroadcastFailed(format!("Cardano broadcast: failed to run curl: {e}"))
-        })?;
-
-    {
-        let stdin = child.stdin.as_mut().ok_or_else(|| {
-            OwsLibError::BroadcastFailed("Cardano broadcast: failed to open curl stdin".into())
-        })?;
-        stdin.write_all(signed_bytes).map_err(|e| {
-            OwsLibError::BroadcastFailed(format!(
-                "Cardano broadcast: failed to write request body to curl stdin: {e}"
-            ))
-        })?;
-    }
-
-    let output = child.wait_with_output().map_err(|e| {
-        OwsLibError::BroadcastFailed(format!("Cardano broadcast: failed to wait for curl: {e}"))
-    })?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(OwsLibError::BroadcastFailed(format!(
-            "Cardano broadcast failed: {stderr}"
-        )));
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let (body, status_raw) = stdout.rsplit_once('\n').unwrap_or(("", stdout.as_str()));
-
-    let status: u16 = status_raw.parse().map_err(|_| {
-        OwsLibError::BroadcastFailed(format!(
-            "Cardano broadcast: could not parse HTTP status from curl output: {stdout}"
-        ))
-    })?;
-
-    if status != 202 {
-        return Err(OwsLibError::BroadcastFailed(format!(
-            "Cardano broadcast: failed to broadcast transaction: {body}"
-        )));
-    }
-
-    let body = body.trim();
-    let invalid_hash = || {
-        OwsLibError::BroadcastFailed(format!(
-            "Cardano broadcast: invalid transaction hash in response for {expected_tx_hash}: {body}"
-        ))
-    };
-    // Koios returns a JSON string. Preserve support for providers returning bare
-    // hex, but do not accept malformed quoting or a merely 64-character string.
-    let tx_hash = if body.starts_with('"') {
-        serde_json::from_str::<String>(body).map_err(|_| invalid_hash())?
-    } else {
-        body.to_string()
-    };
-    let mut hash_bytes = [0u8; 32];
-    hex::decode_to_slice(&tx_hash, &mut hash_bytes).map_err(|_| invalid_hash())?;
-    let tx_hash = hex::encode(hash_bytes);
-    if tx_hash != expected_tx_hash {
-        return Err(OwsLibError::BroadcastFailed(format!(
-            "Cardano broadcast: transaction hash mismatch: expected {expected_tx_hash}, got {tx_hash}"
-        )));
-    }
-
-    Ok(expected_tx_hash)
+    // Computed before the request so the provider's answer is checked against the
+    // transaction we submitted, not merely against its own shape.
+    let expected_tx_id = ows_signer::chains::CardanoSigner::transaction_id(signed_bytes)?;
+    let provider = ows_core::resolve_cardano_provider(rpc_url)
+        .map_err(|e| OwsLibError::BroadcastFailed(e.to_string()))?;
+    provider
+        .broadcast_tx(signed_bytes, &expected_tx_id)
+        .map_err(|e| OwsLibError::BroadcastFailed(e.to_string()))
 }
 
 fn broadcast_xrpl(rpc_url: &str, signed_bytes: &[u8]) -> Result<String, OwsLibError> {
@@ -1289,8 +1237,56 @@ fn extract_json_field(json_str: &str, field: &str) -> Result<String, OwsLibError
 }
 
 #[cfg(test)]
-#[path = "cardano_broadcast_tests.rs"]
-mod cardano_broadcast_tests;
+mod cardano_broadcast_tests {
+    use super::*;
+    use mockito::Server;
+
+    // A signed transaction and the ID of the body it carries — the ID hashes the body,
+    // not the witnessed CBOR that goes over the wire.
+    const SIGNED_TX: &str = "84a300d9010281825820cafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe00018182581d6106094a93d88f9d832697898a387d44ecf2265570a6c92718d8ed03031a001e8480021a000f4240a100d901028182582065a7f55e5fb6964610d0e220c37aadd502041e8f90a86b82c46e531a69612128584081a1235ccc8c96203f379891da1041af709f532f97a73d220eb081f444622701ce5660044f8fe90ec74d3d4ad7c1c0aece569a106f08a298566c51b139285500f5f6";
+    const TX_ID: &str = "6c84b1c9ac839cad80b37ff528e7c6f9991de7d1b9b16055a6d8f7df0a7fa7ee";
+
+    fn submit_to_mock(body: &str) -> Result<String, OwsLibError> {
+        let signed = hex::decode(SIGNED_TX).unwrap();
+        let mut server = Server::new();
+        let mock = server
+            .mock("POST", "/submittx")
+            .match_header("content-type", "application/cbor")
+            .match_body(signed.clone())
+            .with_status(202)
+            .with_body(body)
+            .create();
+
+        let result = broadcast_cardano(&format!("koios|{}", server.url()), &signed);
+
+        mock.assert();
+        result
+    }
+
+    #[test]
+    fn cardano_broadcast_accepts_the_id_of_the_submitted_transaction() {
+        assert_eq!(submit_to_mock(&format!("\"{TX_ID}\"")).unwrap(), TX_ID);
+    }
+
+    #[test]
+    fn cardano_broadcast_rejects_a_malformed_or_unrelated_id() {
+        for body in [
+            "",
+            "z".repeat(64).as_str(),
+            &format!("\"{}\"", "00".repeat(32)),
+        ] {
+            let err = submit_to_mock(body).unwrap_err();
+            assert!(matches!(err, OwsLibError::BroadcastFailed(_)), "{err}");
+            assert!(err.to_string().contains(TX_ID), "{body:?}: {err}");
+        }
+    }
+
+    #[test]
+    fn cardano_broadcast_rejects_an_invalid_transaction_before_any_request() {
+        let err = broadcast_cardano("koios|http://127.0.0.1:1/api/v1", &[0x80]).unwrap_err();
+        assert!(err.to_string().contains("invalid transaction"), "{err}");
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1811,10 +1807,25 @@ mod tests {
         )
         .unwrap();
 
+        let importable = universal_wallet_chains()
+            .iter()
+            .filter(|c| {
+                signer_for_chain(c)
+                    .expect("universal wallet chains resolve")
+                    .supports_private_key_import()
+            })
+            .count();
         assert_eq!(
             info.accounts.len(),
-            UNIVERSAL_WALLET_ACCOUNT_COUNT,
-            "should have one account per chain type plus Cardano testnets"
+            importable,
+            "one account per private-key-importable chain (Midnight is skipped)"
+        );
+        assert!(
+            !info
+                .accounts
+                .iter()
+                .any(|a| a.chain_id.starts_with("midnight:")),
+            "Midnight has no raw private-key import"
         );
 
         // Sign on EVM (secp256k1)
@@ -2753,6 +2764,49 @@ mod tests {
             OwsLibError::WalletNotFound(name) => assert_eq!(name, "del-me-char"),
             other => panic!("expected WalletNotFound, got: {other}"),
         }
+    }
+
+    #[test]
+    fn mnemonic_wallet_includes_midnight_account() {
+        let dir = tempfile::tempdir().unwrap();
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+        let info =
+            import_wallet_mnemonic("mn-midnight", phrase, None, None, Some(dir.path())).unwrap();
+
+        let midnight = info
+            .accounts
+            .iter()
+            .find(|a| a.chain_id == "midnight:mainnet")
+            .expect("mnemonic wallet should derive a Midnight account");
+        assert_eq!(
+            midnight.address,
+            "mn_addr1dwv2rta0a2skyhrvukaw2q9r2sq6yc4jhj63rf7afxpkrrv6g35qw3dyt6"
+        );
+    }
+
+    #[test]
+    fn privkey_wallet_import_rejects_a_mnemonic_only_chain() {
+        let dir = tempfile::tempdir().unwrap();
+
+        for chain in ["midnight", "midnight:preview", "midnight:Preview"] {
+            let err = import_wallet_private_key(
+                "pk-midnight",
+                TEST_PRIVKEY,
+                Some(chain),
+                None,
+                Some(dir.path()),
+                None,
+                None,
+                None,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(&err, OwsLibError::InvalidInput(msg) if msg.contains("mnemonic")),
+                "{chain}: {err:?}"
+            );
+        }
+        assert!(list_wallets(Some(dir.path())).unwrap().is_empty());
     }
 
     #[test]
@@ -3734,6 +3788,57 @@ mod tests {
             OwsLibError::Crypto(_) => {}
             other => panic!("expected Crypto error for None passphrase, got: {other}"),
         }
+    }
+
+    #[test]
+    fn sign_and_send_refuses_a_blockfrost_prefix_from_an_api_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        let vault = tmp.path();
+        let wallet = create_wallet("bf-agent", None, None, Some(vault)).unwrap();
+        let (token, _) = crate::key_ops::create_api_key(
+            "bf-agent-key",
+            std::slice::from_ref(&wallet.id),
+            &[],
+            "",
+            None,
+            Some(vault),
+        )
+        .unwrap();
+
+        let mut server = mockito::Server::new();
+        let no_request = server.mock("GET", mockito::Matcher::Any).expect(0).create();
+        let rpc_url = format!("blockfrost|{}", server.url());
+
+        let err = sign_and_send(
+            &wallet.id,
+            "cardano",
+            "deadbeef",
+            Some(&token),
+            None,
+            Some(&rpc_url),
+            Some(vault),
+        )
+        .unwrap_err();
+        match err {
+            OwsLibError::InvalidInput(msg) => assert!(msg.contains("blockfrost|"), "{msg}"),
+            other => panic!("expected InvalidInput, got: {other}"),
+        }
+        no_request.assert();
+
+        // The owner may still choose a custom Blockfrost host.
+        let owner = sign_and_send(
+            &wallet.id,
+            "cardano",
+            "deadbeef",
+            None,
+            None,
+            Some(&rpc_url),
+            Some(vault),
+        );
+        assert!(
+            !owner.unwrap_err().to_string().contains("API token"),
+            "the owner path must not refuse the prefix"
+        );
     }
 
     #[test]
