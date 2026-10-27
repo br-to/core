@@ -178,6 +178,7 @@ The rule is scoped by request type:
 | `sign_hash` | Deny because an arbitrary digest cannot prove a recipient |
 | `sign_message` | Pass through; EIP-191 messages are not transactions |
 | `sign_typed_data` | Pass through; use `allowed_typed_data_contracts` for EIP-712 data |
+| `read_balance` | Pass through; no signature is produced |
 
 ## Custom Executable Policies
 

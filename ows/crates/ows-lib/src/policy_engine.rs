@@ -56,7 +56,9 @@ fn eval_recipient_allowlist(
     ctx: &PolicyContext,
 ) -> PolicyResult {
     match ctx.request_type {
-        PolicyRequestType::SignMessage | PolicyRequestType::SignTypedData => {
+        PolicyRequestType::SignMessage
+        | PolicyRequestType::SignTypedData
+        | PolicyRequestType::ReadBalance => {
             return PolicyResult::allowed();
         }
         PolicyRequestType::SignHash => {
